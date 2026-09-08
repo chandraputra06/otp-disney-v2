@@ -4,7 +4,6 @@ import { createSupabaseAdmin } from '@/lib/supabase/admin';
 import { createSupabaseServerClient } from '@/lib/supabase/server';
 
 export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
 
 async function addAccount(formData: FormData) {
   'use server';
