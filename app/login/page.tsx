@@ -6,7 +6,6 @@ import { createSupabaseBrowser } from '@/lib/supabase/client';
 
 export default function LoginPage() {
   const router = useRouter();
-  const supabase = createSupabaseBrowser();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [err, setErr] = useState<string | null>(null);
@@ -15,6 +14,7 @@ export default function LoginPage() {
   const submit = async () => {
     setErr(null);
     setLoading(true);
+    const supabase = createSupabaseBrowser(); // dibuat saat diklik, bukan saat build
     const { error } = await supabase.auth.signInWithPassword({ email, password });
     setLoading(false);
     if (error) {
