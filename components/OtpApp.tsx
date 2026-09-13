@@ -166,7 +166,7 @@ export default function OtpApp() {
               {loading ? 'Memproses…' : 'Ambil OTP'}
             </button>
           </div>
-          {loading && (
+          {loading && !result && (
             <div className="otp-loading-cover" role="status" aria-live="polite" aria-busy="true">
               <div className="otp-loading-stage" style={{ ['--fill' as string]: `${loadingProgress}%` }}>
                 <div className="loading-fill" />
@@ -230,7 +230,7 @@ export default function OtpApp() {
           </div>
         )}
 
-        {!result && (
+        {!result && !loading && (
           <div className="otp-empty">
             <div className="ic"><i className="fa-solid fa-shield-halved" /></div>
             <h3>Belum ada hasil OTP</h3>
