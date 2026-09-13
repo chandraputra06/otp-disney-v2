@@ -71,24 +71,46 @@ export interface DisneyMessage {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractOtpFrom(text: string | null): string | null {
+  if (!text) return null;
+
+  // 1) Paling kuat: angka 4-8 digit yang muncul TEPAT setelah kata kunci OTP
+  //    (mis. "passcode for Disney+ 148870", "kode verifikasi: 148870")
+  const nearKeyword = text.match(
+    /(?:passcode|one[-\s]?time|kode|code|otp|verifikasi|verification)[^\d]{0,40}(\d{4,8})/i
+  );
+  if (nearKeyword) return nearKeyword[1];
+
+  // 2) Angka 6 digit yang berdiri sendiri (dikelilingi spasi/awal/akhir)
+  const six = text.match(/(?:^|[\s:>(])(\d{6})(?:$|[\s<.,)])/);
+  if (six) return six[1];
+
+  // 3) Fallback: 4-8 digit berdiri sendiri
+  const gen = text.match(/(?:^|[\s:>(])(\d{4,8})(?:$|[\s<.,)])/);
+  if (gen) return gen[1];
+
+  return null;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function parseMessage(full: any): DisneyMessage {
   const payload = full.payload;
   const bodies = extractBodies(payload);
-  const combined = [
-    header(payload, 'Subject'),
-    full.snippet,
-    bodies.text,
-    bodies.html ? bodies.html.replace(/<[^>]+>/g, ' ') : null,
-  ]
-    .filter(Boolean)
-    .join('\n');
-  const match = combined.match(/\b\d{4,6}\b/);
+
+  // Sumber bersih dulu (snippet Gmail sudah dibersihkan Google), HTML paling akhir.
+  const htmlText = bodies.html ? bodies.html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ') : null;
+  const otpCode =
+    extractOtpFrom(full.snippet) ||
+    extractOtpFrom(header(payload, 'Subject')) ||
+    extractOtpFrom(bodies.text) ||
+    extractOtpFrom(htmlText);
+
   return {
     message_id: full.id ?? null,
     snippet: full.snippet ?? null,
     subject: header(payload, 'Subject'),
     sender_email: header(payload, 'From'),
-    otp_code: match ? match[0] : null,
+    otp_code: otpCode,
     received_at: full.internalDate ? new Date(Number(full.internalDate)).toISOString() : null,
   };
 }
@@ -116,7 +138,7 @@ export async function fetchLatestDisneyMessage(
   const gmail = google.gmail({ version: 'v1', auth });
   const opts = { timeout: GMAIL_TIMEOUT_MS };
 
-  const q = 'newer_than:2d (Disney OR "Disney+" OR kode OR verifikasi OR OTP)';
+const q = 'newer_than:2d from:disneyplus.com (passcode OR "one-time" OR kode OR OTP)';
   const list = await gmail.users.messages.list({ userId: 'me', maxResults: 5, q }, opts);
   const messages = list.data.messages || [];
   if (messages.length === 0) return null;
