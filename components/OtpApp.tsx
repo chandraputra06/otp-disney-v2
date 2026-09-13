@@ -1,5 +1,6 @@
 'use client';
 
+import Image from 'next/image';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { formatWita, witaTimeShort } from '@/lib/time';
 
@@ -115,12 +116,17 @@ export default function OtpApp() {
     <main className="otp-wrap">
       <div className="otp-container">
         <div className="otp-head">
+          <div className="otp-brand">
+            <div className="otp-logo-wrap">
+              <Image src="/logo-orinimo.png" alt="Orinimo logo" width={72} height={72} priority />
+            </div>
+          </div>
           <span className="otp-pill"><span className="dot" />Disney OTP · Orinimo</span>
           <h1>Cek OTP Disney</h1>
           <p>Masukkan nomor handphone untuk mengambil OTP terbaru.</p>
         </div>
 
-        <div className="otp-card">
+        <div className={`otp-card ${loading ? 'is-loading' : ''}`}>
           <p className="field-label">Nomor handphone</p>
           <div className="otp-inrow">
             <input
@@ -130,12 +136,27 @@ export default function OtpApp() {
               value={phone}
               onChange={(e) => setPhone(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && fetchOtp(phone.trim())}
+              disabled={loading}
             />
             <button className="btn-primary" onClick={() => fetchOtp(phone.trim())} disabled={loading}>
               <i className={loading ? 'fa-solid fa-spinner spin' : 'fa-solid fa-magnifying-glass'} />
               {loading ? 'Memproses…' : 'Ambil OTP'}
             </button>
           </div>
+          {loading && (
+            <div className="otp-loading-box" role="status" aria-live="polite">
+              <div className="loading-orb" />
+              <div className="loading-text">
+                <span className="loading-title">Mengambil data OTP</span>
+                <span className="loading-sub">Sedang mencari informasi terbaru dari Disney...</span>
+              </div>
+              <div className="loading-dots" aria-hidden="true">
+                <span />
+                <span />
+                <span />
+              </div>
+            </div>
+          )}
           {error && <p className="field-err">{error}</p>}
         </div>
 
