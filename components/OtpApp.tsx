@@ -32,6 +32,7 @@ const chipStyle = (s: OtpStatus): { bg: string; fg: string; icon: string } => {
 export default function OtpApp() {
   const [phone, setPhone] = useState('');
   const [loading, setLoading] = useState(false);
+  const [loadingProgress, setLoadingProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<OtpResult | null>(null);
   const [secs, setSecs] = useState(REFRESH_SECONDS);
@@ -46,6 +47,22 @@ export default function OtpApp() {
     setToast(true);
     setTimeout(() => setToast(false), 1300);
   };
+
+  useEffect(() => {
+    if (!loading) {
+      setLoadingProgress(0);
+      return;
+    }
+
+    const startedAt = Date.now();
+    const id = setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+      const progress = Math.min(Math.round((elapsed / 2800) * 100), 96);
+      setLoadingProgress(progress);
+    }, 40);
+
+    return () => clearInterval(id);
+  }, [loading]);
 
   const copyCode = (code: string | null) => {
     if (!code) return;
@@ -64,7 +81,10 @@ export default function OtpApp() {
     if (!num) return;
     lastPhone.current = num;
     setError(null);
-    if (!silent) setLoading(true);
+    if (!silent) {
+      setLoading(true);
+      setLoadingProgress(0);
+    }
     try {
       const res = await fetch('/api/otp', {
         method: 'POST',
@@ -87,7 +107,10 @@ export default function OtpApp() {
     } catch {
       setError('Gagal terhubung ke server. Coba lagi.');
     } finally {
-      if (!silent) setLoading(false);
+      if (!silent) {
+        setLoading(false);
+        setLoadingProgress(0);
+      }
     }
   }, []);
 
@@ -144,16 +167,13 @@ export default function OtpApp() {
             </button>
           </div>
           {loading && (
-            <div className="otp-loading-box" role="status" aria-live="polite">
-              <div className="loading-orb" />
-              <div className="loading-text">
-                <span className="loading-title">Mengambil data OTP</span>
-                <span className="loading-sub">Sedang mencari informasi terbaru dari Disney...</span>
-              </div>
-              <div className="loading-dots" aria-hidden="true">
-                <span />
-                <span />
-                <span />
+            <div className="otp-loading-cover" role="status" aria-live="polite" aria-busy="true">
+              <div className="otp-loading-stage" style={{ ['--fill' as string]: `${loadingProgress}%` }}>
+                <div className="loading-fill" />
+                <div className="loading-ring" />
+                <div className="loading-logo-wrap">
+                  <Image src="/logo-orinimo.png" alt="Orinimo logo" width={72} height={72} priority />
+                </div>
               </div>
             </div>
           )}
@@ -161,7 +181,7 @@ export default function OtpApp() {
         </div>
 
         {result && chip && (
-          <div className="otp-panel">
+          <div className={`otp-panel ${loading ? 'is-loading-overlay' : ''}`}>
             <div className="otp-toprow">
               <span className="otp-chip" style={{ background: chip.bg, color: chip.fg }}>
                 <i className={`fa-solid ${chip.icon}`} />{result.status_label}
@@ -195,6 +215,18 @@ export default function OtpApp() {
                 <i className={`fa-solid ${running ? 'fa-pause' : 'fa-play'}`} />
               </button>
             </div>
+
+            {loading && (
+              <div className="otp-panel-overlay" role="status" aria-live="polite" aria-busy="true">
+                <div className="otp-loading-stage" style={{ ['--fill' as string]: `${loadingProgress}%` }}>
+                  <div className="loading-fill" />
+                  <div className="loading-ring" />
+                  <div className="loading-logo-wrap">
+                    <Image src="/logo-orinimo.png" alt="Orinimo logo" width={72} height={72} priority />
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
