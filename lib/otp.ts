@@ -1,13 +1,16 @@
-// Logika inti: ambil OTP berdasarkan nomor HP.
-// Termasuk COOLDOWN (anti-spam) + CACHE (hemat panggilan Gmail saat auto-refresh).
-import type { SupabaseClient } from '@supabase/supabase-js';
+
 import { createSupabaseAdmin } from './supabase/admin';
 import { fetchLatestDisneyMessage } from './gmail';
 
-const COOLDOWN_SECONDS = 5;  // jarak minimal antar-pemanggilan Gmail per nomor
-const CACHE_SECONDS = 12;    // sajikan OTP sukses terbaru tanpa panggil Gmail lagi
+const COOLDOWN_SECONDS = 5;
 
-export type OtpStatus = 'success' | 'cooldown' | 'not_found' | 'parse_failed' | 'fetch_error';
+export type OtpStatus =
+  | 'success'
+  | 'unchanged'
+  | 'cooldown'
+  | 'not_found'
+  | 'parse_failed'
+  | 'fetch_error';
 
 export interface OtpResult {
   status: OtpStatus;
@@ -15,159 +18,282 @@ export interface OtpResult {
   phone_number: string;
   message: string;
   otp_code: string | null;
-  received_at: string | null;      // ISO UTC; frontend format ke WITA
+  received_at: string | null;
   last_otp_code: string | null;
   last_received_at: string | null;
 }
 
-async function lastSuccess(supabase: SupabaseClient, accountId: string) {
-  const { data } = await supabase
-    .from('otp_messages')
-    .select('otp_code, received_at')
-    .eq('otp_account_id', accountId)
-    .eq('fetched_status', 'success')
-    .not('otp_code', 'is', null)
-    .order('received_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
+interface PreviousOtp {
+  message_id: string | null;
+  otp_code: string | null;
+  received_at: string | null;
+}
+
+function makeResult(
+  phone: string,
+  status: OtpStatus,
+  label: string,
+  message: string,
+  previous?: PreviousOtp | null
+): OtpResult {
   return {
-    last_otp_code: data?.otp_code ?? null,
-    last_received_at: data?.received_at ?? null,
+    status,
+    status_label: label,
+    phone_number: phone,
+    message,
+    otp_code: null,
+    received_at: null,
+    last_otp_code: previous?.otp_code ?? null,
+    last_received_at: previous?.received_at ?? null,
   };
 }
 
-export async function fetchByPhoneNumber(phone: string): Promise<OtpResult> {
+export async function fetchByPhoneNumber(
+  phone: string
+): Promise<OtpResult> {
   const supabase = createSupabaseAdmin();
 
-  const { data: account } = await supabase
-    .from('otp_accounts')
-    .select('*')
-    .eq('phone_number', phone)
-    .eq('is_active', true)
-    .maybeSingle();
+  // 1. Cari akun aktif berdasarkan nomor.
+  const { data: account, error: accountError } =
+    await supabase
+      .from('otp_accounts')
+      .select('id')
+      .eq('phone_number', phone)
+      .eq('is_active', true)
+      .maybeSingle();
 
-  if (!account) {
-    return {
-      status: 'not_found', status_label: 'Tidak Ditemukan', phone_number: phone,
-      message: 'Nomor handphone tidak terdaftar atau tidak aktif.',
-      otp_code: null, received_at: null, last_otp_code: null, last_received_at: null,
-    };
+  if (accountError) {
+    throw new Error('Gagal membaca akun OTP.');
   }
 
-  // 1) CACHE: kalau baru saja ada OTP sukses, sajikan tanpa memanggil Gmail
-  const { data: recent } = await supabase
+  if (!account) {
+    return makeResult(
+      phone,
+      'not_found',
+      'Tidak Ditemukan',
+      'Nomor handphone tidak terdaftar atau tidak aktif.'
+    );
+  }
+
+  // 2. Baca riwayat OTP sukses paling baru.
+  const previousPromise = supabase
     .from('otp_messages')
-    .select('otp_code, received_at, created_at')
+    .select('message_id, otp_code, received_at')
     .eq('otp_account_id', account.id)
     .eq('fetched_status', 'success')
     .not('otp_code', 'is', null)
-    .order('created_at', { ascending: false })
+    .order('received_at', {
+      ascending: false,
+    })
     .limit(1)
     .maybeSingle();
 
-  if (recent?.created_at) {
-    const ageSec = (Date.now() - new Date(recent.created_at).getTime()) / 1000;
-    if (ageSec < CACHE_SECONDS) {
-      return {
-        status: 'success', status_label: 'Berhasil', phone_number: phone,
-        message: 'OTP terbaru.', otp_code: recent.otp_code, received_at: recent.received_at,
-        last_otp_code: null, last_received_at: null,
-      };
-    }
-  }
-
-  // 2) COOLDOWN: cegah pemanggilan beruntun
-  if (account.last_checked_at) {
-    const ageSec = (Date.now() - new Date(account.last_checked_at).getTime()) / 1000;
-    if (ageSec < COOLDOWN_SECONDS) {
-      const fb = await lastSuccess(supabase, account.id);
-      return {
-        status: 'cooldown', status_label: 'Tunggu Sebentar', phone_number: phone,
-        message: `Silakan tunggu ${Math.ceil(COOLDOWN_SECONDS - ageSec)} detik sebelum refresh lagi.`,
-        otp_code: null, received_at: null, ...fb,
-      };
-    }
-  }
-
-  await supabase
-    .from('otp_accounts')
-    .update({ last_checked_at: new Date().toISOString() })
-    .eq('id', account.id);
-
-  // 3) Ambil token Gmail
-  const { data: token } = await supabase
+  // 3. Ambil token Gmail.
+  const tokenPromise = supabase
     .from('gmail_tokens')
-    .select('*')
+    .select('access_token, refresh_token, expires_at')
     .eq('otp_account_id', account.id)
     .maybeSingle();
 
-  if (!token) {
-    const fb = await lastSuccess(supabase, account.id);
-    return {
-      status: 'fetch_error', status_label: 'Belum Terhubung', phone_number: phone,
-      message: 'Akun Gmail belum terhubung untuk nomor ini.',
-      otp_code: null, received_at: null, ...fb,
-    };
+  const [previousResponse, tokenResponse] =
+    await Promise.all([
+      previousPromise,
+      tokenPromise,
+    ]);
+
+  if (previousResponse.error || tokenResponse.error) {
+    throw new Error('Gagal membaca data OTP.');
   }
 
-  // 4) Panggil Gmail (dengan timeout di lib/gmail.ts)
+  const previous = previousResponse.data as
+    | PreviousOtp
+    | null;
+
+  const token = tokenResponse.data;
+
+  if (!token?.access_token && !token?.refresh_token) {
+    return makeResult(
+      phone,
+      'fetch_error',
+      'Gmail Belum Terhubung',
+      'Akun Gmail untuk nomor ini belum terhubung.',
+      previous
+    );
+  }
+
+  // 4. Cooldown atomik berdasarkan timestamp database.
+  // Mencegah dua request bersamaan sama-sama
+  // mengakses Gmail untuk satu akun.
+  const now = new Date();
+  const cutoff = new Date(
+    now.getTime() - COOLDOWN_SECONDS * 1000
+  );
+
+  const { data: claimed, error: claimError } =
+    await supabase
+      .from('otp_accounts')
+      .update({
+        last_checked_at: now.toISOString(),
+      })
+      .eq('id', account.id)
+      .or(
+        `last_checked_at.is.null,last_checked_at.lt.${cutoff.toISOString()}`
+      )
+      .select('id')
+      .maybeSingle();
+
+  if (claimError) {
+    throw new Error(
+      'Gagal memperbarui cooldown OTP.'
+    );
+  }
+
+  if (!claimed) {
+    return makeResult(
+      phone,
+      'cooldown',
+      'Tunggu Sebentar',
+      'Pemeriksaan Gmail berikutnya belum tersedia.',
+      previous
+    );
+  }
+
+  // 5. Ambil email terbaru dari Gmail.
   try {
-    const msg = await fetchLatestDisneyMessage(
-      { access_token: token.access_token, refresh_token: token.refresh_token, expires_at: token.expires_at },
+    const message = await fetchLatestDisneyMessage(
+      {
+        access_token: token.access_token,
+        refresh_token: token.refresh_token,
+        expires_at: token.expires_at,
+      },
       async ({ access_token, expiry_date }) => {
-        await supabase
+        const updateValues: {
+          access_token: string;
+          expires_at?: string;
+        } = {
+          access_token,
+        };
+
+        if (expiry_date) {
+          updateValues.expires_at =
+            new Date(expiry_date).toISOString();
+        }
+
+        const { error } = await supabase
           .from('gmail_tokens')
-          .update({
-            access_token,
-            expires_at: expiry_date ? new Date(expiry_date).toISOString() : null,
-          })
+          .update(updateValues)
           .eq('otp_account_id', account.id);
+
+        if (error) {
+          throw new Error(
+            'Gagal memperbarui token Gmail.'
+          );
+        }
       }
     );
 
-    if (!msg) {
-      await supabase.from('otp_messages').insert({ otp_account_id: account.id, fetched_status: 'not_found' });
-      const fb = await lastSuccess(supabase, account.id);
-      return {
-        status: 'not_found', status_label: 'Email Tidak Ditemukan', phone_number: phone,
-        message: 'Email Disney terbaru belum ditemukan.',
-        otp_code: null, received_at: null, ...fb,
-      };
+    if (!message) {
+      return makeResult(
+        phone,
+        'not_found',
+        'Email Belum Ditemukan',
+        'Belum ditemukan email verifikasi Disney terbaru.',
+        previous
+      );
     }
 
-    await supabase.from('otp_messages').insert({
-      otp_account_id: account.id,
-      message_id: msg.message_id,
-      sender_email: msg.sender_email,
-      subject: msg.subject,
-      email_snippet: msg.snippet,
-      otp_code: msg.otp_code,
-      fetched_status: msg.otp_code ? 'success' : 'parse_failed',
-      received_at: msg.received_at,
-    });
+    // 6. Jangan anggap email lama sebagai kode baru.
+    const sameMessage =
+      Boolean(message.message_id) &&
+      message.message_id === previous?.message_id;
 
-    if (!msg.otp_code) {
-      const fb = await lastSuccess(supabase, account.id);
-      return {
-        status: 'parse_failed', status_label: 'OTP Tidak Terbaca', phone_number: phone,
-        message: 'Email ditemukan, tetapi kode OTP belum berhasil diekstrak.',
-        otp_code: null, received_at: msg.received_at, ...fb,
-      };
+    const currentTime = message.received_at
+      ? new Date(message.received_at).getTime()
+      : 0;
+
+    const previousTime = previous?.received_at
+      ? new Date(previous.received_at).getTime()
+      : 0;
+
+    const isOlder =
+      previousTime > 0 &&
+      currentTime > 0 &&
+      currentTime <= previousTime;
+
+    if (sameMessage || isOlder) {
+      return makeResult(
+        phone,
+        'unchanged',
+        'Belum Ada Kode Baru',
+        'Email terbaru belum berubah. Kode sebelumnya hanya ditampilkan sebagai riwayat.',
+        previous
+      );
+    }
+
+    // 7. Email baru ada, tetapi kode tidak ditemukan.
+    if (!message.otp_code) {
+      return makeResult(
+        phone,
+        'parse_failed',
+        'Kode Tidak Terbaca',
+        'Email Disney ditemukan tetapi kode verifikasi belum berhasil dibaca.',
+        previous
+      );
+    }
+
+    // 8. Simpan OTP baru.
+    const { error: insertError } = await supabase
+      .from('otp_messages')
+      .insert({
+        otp_account_id: account.id,
+        message_id: message.message_id,
+        sender_email: message.sender_email,
+        subject: message.subject,
+        email_snippet: message.snippet,
+        otp_code: message.otp_code,
+        fetched_status: 'success',
+        received_at: message.received_at,
+      });
+
+    if (insertError) {
+      console.error(
+        '[OTP] Gagal menyimpan email baru:',
+        insertError.message
+      );
+
+      return makeResult(
+        phone,
+        'fetch_error',
+        'Gagal Menyimpan OTP',
+        'Kode ditemukan tetapi gagal disimpan ke database.',
+        previous
+      );
     }
 
     return {
-      status: 'success', status_label: 'Berhasil', phone_number: phone,
-      message: 'OTP berhasil ditemukan.',
-      otp_code: msg.otp_code, received_at: msg.received_at,
-      last_otp_code: null, last_received_at: null,
+      status: 'success',
+      status_label: 'Berhasil',
+      phone_number: phone,
+      message: 'Kode OTP terbaru berhasil ditemukan.',
+      otp_code: message.otp_code,
+      received_at: message.received_at,
+      last_otp_code: null,
+      last_received_at: null,
     };
-  } catch {
-    await supabase.from('otp_messages').insert({ otp_account_id: account.id, fetched_status: 'fetch_error' });
-    const fb = await lastSuccess(supabase, account.id);
-    return {
-      status: 'fetch_error', status_label: 'Terjadi Kesalahan', phone_number: phone,
-      message: 'Gagal mengambil email OTP.',
-      otp_code: null, received_at: null, ...fb,
-    };
+  } catch (error) {
+    console.error(
+      '[OTP] Gagal memeriksa Gmail:',
+      error instanceof Error
+        ? error.message
+        : 'Unknown error'
+    );
+
+    return makeResult(
+      phone,
+      'fetch_error',
+      'Gagal Memeriksa Email',
+      'Gmail belum dapat diakses. Silakan coba kembali.',
+      previous
+    );
   }
 }
