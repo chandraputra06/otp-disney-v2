@@ -3,14 +3,31 @@ import { google } from 'googleapis';
 import type { gmail_v1 } from 'googleapis';
 import type { OAuth2Client } from 'google-auth-library';
 
-const GMAIL_TIMEOUT_MS = 8_000;
-const MAX_MESSAGES = 10;
+const GMAIL_TIMEOUT_MS = 10_000;
+const MAX_MESSAGES = 15;
 
-// Sesuai alamat pengirim pada screenshot Gmail.
-// Bisa diubah melalui environment variable.
-const DISNEY_SENDER =
-  process.env.OTP_GMAIL_SENDER?.trim().toLowerCase() ||
-  'disneyplus@trx.mail2.disneyplus.com';
+function envValue(value?: string): string {
+  return (value ?? '')
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .trim();
+}
+
+const DISNEY_SENDER = (
+  envValue(process.env.OTP_GMAIL_SENDER) ||
+  'disneyplus@trx.mail2.disneyplus.com'
+).toLowerCase();
+
+const DEBUG_GMAIL =
+  process.env.OTP_GMAIL_DEBUG === 'true';
+
+const EXPECTED_GMAIL = envValue(
+  process.env.OTP_EXPECTED_GMAIL
+).toLowerCase();
+
+// ========================================
+// GOOGLE OAUTH
+// ========================================
 
 export function makeOAuthClient(): OAuth2Client {
   return new google.auth.OAuth2(
@@ -31,10 +48,18 @@ export function getAuthUrl(state: string): string {
   });
 }
 
-export async function exchangeCodeForTokens(code: string) {
-  const { tokens } = await makeOAuthClient().getToken(code);
+export async function exchangeCodeForTokens(
+  code: string
+) {
+  const { tokens } =
+    await makeOAuthClient().getToken(code);
+
   return tokens;
 }
+
+// ========================================
+// TYPES
+// ========================================
 
 export interface DisneyMessage {
   message_id: string | null;
@@ -56,6 +81,27 @@ interface RefreshedToken {
   expiry_date: number | null;
 }
 
+// ========================================
+// HELPERS
+// ========================================
+
+function debugLog(
+  label: string,
+  data: Record<string, unknown>
+) {
+  if (!DEBUG_GMAIL) return;
+
+  console.info(`[GMAIL DEBUG] ${label}`, data);
+}
+
+function maskEmail(email: string): string {
+  const [name = '', domain = ''] = email.split('@');
+
+  return (
+    `${name.slice(0, 2)}***@${domain || 'unknown'}`
+  );
+}
+
 function decodeB64Url(
   data?: string | null
 ): string | null {
@@ -71,6 +117,34 @@ function decodeB64Url(
   }
 }
 
+function getHeader(
+  payload: gmail_v1.Schema$MessagePart | null | undefined,
+  name: string
+): string | null {
+  return (
+    payload?.headers?.find(
+      (header) =>
+        header.name?.toLowerCase() === name.toLowerCase()
+    )?.value ?? null
+  );
+}
+
+function normalizeEmailAddress(
+  from: string | null
+): string | null {
+  if (!from) return null;
+
+  const match = from.match(
+    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i
+  );
+
+  return match?.[0]?.toLowerCase() ?? null;
+}
+
+// ========================================
+// EMAIL BODY EXTRACTION
+// ========================================
+
 function extractBodies(
   payload?: gmail_v1.Schema$MessagePart | null
 ): {
@@ -85,8 +159,8 @@ function extractBodies(
   ) => {
     if (!part) return;
 
-    const decoded = decodeB64Url(part.body?.data);
     const mime = part.mimeType?.toLowerCase();
+    const decoded = decodeB64Url(part.body?.data);
 
     if (decoded) {
       if (mime === 'text/html') {
@@ -112,33 +186,21 @@ function extractBodies(
   };
 }
 
-function getHeader(
-  payload: gmail_v1.Schema$MessagePart | null | undefined,
-  name: string
-): string | null {
-  return (
-    payload?.headers?.find(
-      (item) =>
-        item.name?.toLowerCase() === name.toLowerCase()
-    )?.value ?? null
-  );
-}
-
-function normalizeEmailAddress(
-  from: string | null
-): string | null {
-  if (!from) return null;
-
-  const angle = from.match(/<([^>]+)>/);
-  return (angle?.[1] ?? from).trim().toLowerCase();
-}
-
 function htmlToText(html: string): string {
   return html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(
+      /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+      ' '
+    )
+    .replace(
+      /<style\b[^>]*>[\s\S]*?<\/style>/gi,
+      ' '
+    )
     .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/(?:p|div|tr|table|h[1-6])>/gi, '\n')
+    .replace(
+      /<\/(?:p|div|tr|table|h[1-6])>/gi,
+      '\n'
+    )
     .replace(/<[^>]*>/g, ' ')
     .replace(/&nbsp;|&#160;/gi, ' ')
     .replace(/&amp;/gi, '&')
@@ -147,15 +209,25 @@ function htmlToText(html: string): string {
     .replace(/&#(\d+);/g, (_, num: string) =>
       String.fromCodePoint(Number(num))
     )
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) =>
-      String.fromCodePoint(parseInt(hex, 16))
-    );
+    .replace(
+      /&#x([0-9a-f]+);/gi,
+      (_, hex: string) =>
+        String.fromCodePoint(parseInt(hex, 16))
+    )
+    .replace(/[ \t]+/g, ' ')
+    .trim();
 }
 
-// Mengambil kandidat enam digit, termasuk jika
-// angka dipisahkan spasi oleh template email.
-function findSixDigitCodes(text: string): string[] {
+// ========================================
+// OTP EXTRACTION
+// ========================================
+
+function findSixDigitCodes(
+  text: string
+): string[] {
   const codes: string[] = [];
+
+  // Mendukung 123456 dan 1 2 3 4 5 6.
   const pattern =
     /(?<!\d)(?:\d[ \t]{0,2}){5}\d(?!\d)/g;
 
@@ -170,19 +242,24 @@ function findSixDigitCodes(text: string): string[] {
   return [...new Set(codes)];
 }
 
-function extractOtpCode(content: string): string | null {
+function extractOtpCode(
+  content: string
+): string | null {
   const text = content
     .replace(/\u00a0/g, ' ')
     .replace(/\r/g, '')
     .trim();
 
-  // Prioritaskan angka di sekitar kata kunci.
   const keywords =
     /(?:one[\s-]?time passcode|verification code|security code|passcode|otp|kode verifikasi|kode keamanan|kode otp)/gi;
 
+  // Cari kode di sekitar keterangan verifikasi.
   for (const keyword of text.matchAll(keywords)) {
-    const start = keyword.index ?? 0;
+    const start =
+      (keyword.index ?? 0) + keyword[0].length;
+
     const nearby = text.slice(start, start + 350);
+
     const codes = findSixDigitCodes(nearby);
 
     if (codes.length === 1) {
@@ -190,26 +267,36 @@ function extractOtpCode(content: string): string | null {
     }
   }
 
-  // Fallback hanya bila ada tepat satu kandidat unik.
-  // Jika ada beberapa kode berbeda, jangan menebak.
-  const codes = findSixDigitCodes(text);
+  // Jika hanya ada satu kandidat unik di seluruh
+  // teks, gunakan kandidat tersebut.
+  // Jangan menebak jika ada beberapa kode berbeda.
+  const allCodes = findSixDigitCodes(text);
 
-  return codes.length === 1 ? codes[0] : null;
+  return allCodes.length === 1
+    ? allCodes[0]
+    : null;
 }
+
+// ========================================
+// PARSE GMAIL MESSAGE
+// ========================================
 
 function parseMessage(
   full: gmail_v1.Schema$Message
 ): DisneyMessage {
   const payload = full.payload;
+
   const bodies = extractBodies(payload);
 
   const subject = getHeader(payload, 'Subject');
   const sender = getHeader(payload, 'From');
 
+  // Prioritaskan text/plain yang berasal langsung
+  // dari email, kemudian HTML, lalu snippet.
   const sources = [
-    `${subject ?? ''}\n${bodies.text}`,
-    `${subject ?? ''}\n${htmlToText(bodies.html)}`,
-    `${subject ?? ''}\n${full.snippet ?? ''}`,
+    bodies.text,
+    htmlToText(bodies.html),
+    full.snippet ?? '',
   ];
 
   let otpCode: string | null = null;
@@ -223,8 +310,10 @@ function parseMessage(
   }
 
   const internalDate = Number(full.internalDate);
+
   const receivedAt =
-    Number.isFinite(internalDate) && internalDate > 0
+    Number.isFinite(internalDate) &&
+    internalDate > 0
       ? new Date(internalDate).toISOString()
       : null;
 
@@ -238,6 +327,10 @@ function parseMessage(
   };
 }
 
+// ========================================
+// VALIDATE DISNEY EMAIL
+// ========================================
+
 function isRelevantDisneyEmail(
   message: DisneyMessage
 ): boolean {
@@ -249,11 +342,15 @@ function isRelevantDisneyEmail(
     return false;
   }
 
-  // Hanya email terkait kode verifikasi.
-  return /(?:passcode|verification|security code|one.time code|otp|kode verifikasi)/i.test(
+  // Tetap pastikan subjek terkait verifikasi.
+  return /(?:passcode|verification|security code|one[\s-]?time|otp|kode verifikasi)/i.test(
     message.subject ?? ''
   );
 }
+
+// ========================================
+// FETCH LATEST DISNEY MESSAGE
+// ========================================
 
 export async function fetchLatestDisneyMessage(
   tokens: GmailTokens,
@@ -277,19 +374,20 @@ export async function fetchLatestDisneyMessage(
     auth.on('tokens', (newTokens) => {
       if (!newTokens.access_token) return;
 
-      const write = onTokenRefresh({
-        access_token: newTokens.access_token,
-        expiry_date: newTokens.expiry_date ?? null,
-      }).catch((error) => {
-        console.error(
-          '[GMAIL] Gagal menyimpan token:',
-          error instanceof Error
-            ? error.message
-            : 'Unknown error'
-        );
-      });
-
-      tokenWrites.push(write);
+      tokenWrites.push(
+        onTokenRefresh({
+          access_token: newTokens.access_token,
+          expiry_date:
+            newTokens.expiry_date ?? null,
+        }).catch((error) => {
+          console.error(
+            '[GMAIL] Token update failed:',
+            error instanceof Error
+              ? error.message
+              : 'Unknown error'
+          );
+        })
+      );
     });
   }
 
@@ -298,83 +396,263 @@ export async function fetchLatestDisneyMessage(
     auth,
   });
 
-  const requestOptions = {
+  const options = {
     timeout: GMAIL_TIMEOUT_MS,
   };
 
-  const query =
-    process.env.OTP_GMAIL_QUERY?.trim() ||
-    `from:${DISNEY_SENDER} newer_than:2d`;
-
   try {
-    const response = await gmail.users.messages.list(
-      {
-        userId: 'me',
-        q: query,
-        maxResults: MAX_MESSAGES,
-      },
-      requestOptions
+    // ------------------------------------
+    // 1. PERIKSA AKUN GMAIL TERHUBUNG
+    // ------------------------------------
+
+    if (DEBUG_GMAIL || EXPECTED_GMAIL) {
+      const profile = await gmail.users.getProfile(
+        { userId: 'me' },
+        options
+      );
+
+      const linkedEmail = (
+        profile.data.emailAddress ?? ''
+      ).trim().toLowerCase();
+
+      debugLog('Connected account', {
+        account: maskEmail(linkedEmail),
+      });
+
+      if (
+        EXPECTED_GMAIL &&
+        linkedEmail !== EXPECTED_GMAIL
+      ) {
+        console.error(
+          '[GMAIL] Akun OAuth tidak sesuai dengan inbox yang diharapkan.'
+        );
+
+        throw new Error(
+          'Akun Gmail yang terhubung tidak sesuai.'
+        );
+      }
+    }
+
+    // ------------------------------------
+    // 2. SIAPKAN QUERY PENCARIAN
+    // ------------------------------------
+
+    const senderQuery =
+      `from:${DISNEY_SENDER} newer_than:3d`;
+
+    const customQuery = envValue(
+      process.env.OTP_GMAIL_QUERY
     );
 
-    const messages = (
-      response.data.messages ?? []
-    ).filter((item) => Boolean(item.id));
+    // Pencarian berdasarkan pengirim selalu
+    // disertakan agar query custom tidak
+    // menyembunyikan email yang lebih baru.
+    const queries = [
+      senderQuery,
+      ...(customQuery &&
+      customQuery !== senderQuery
+        ? [customQuery]
+        : []),
+    ];
 
-    if (messages.length === 0) {
+    const candidateIds = new Set<string>();
+
+    for (const query of queries) {
+      const response =
+        await gmail.users.messages.list(
+          {
+            userId: 'me',
+            q: query,
+            maxResults: MAX_MESSAGES,
+          },
+          options
+        );
+
+      const found = response.data.messages ?? [];
+
+      for (const message of found) {
+        if (message.id) {
+          candidateIds.add(message.id);
+        }
+      }
+
+      debugLog('Search', {
+        type:
+          query === senderQuery
+            ? 'sender'
+            : 'custom',
+        results: found.length,
+      });
+    }
+
+    // ------------------------------------
+    // 3. PENCARIAN CADANGAN
+    // ------------------------------------
+
+    // Jika query pengirim tidak menemukan pesan,
+    // cari berdasarkan subjek untuk diagnosis.
+    // Hasilnya tetap wajib lulus pemeriksaan
+    // alamat pengirim di bawah.
+    if (candidateIds.size === 0) {
+      const fallback =
+        await gmail.users.messages.list(
+          {
+            userId: 'me',
+            q:
+              'subject:"Your one-time passcode for Disney+" newer_than:3d',
+            maxResults: MAX_MESSAGES,
+          },
+          options
+        );
+
+      for (const message of (
+        fallback.data.messages ?? []
+      )) {
+        if (message.id) {
+          candidateIds.add(message.id);
+        }
+      }
+
+      debugLog('Fallback search', {
+        results:
+          fallback.data.messages?.length ?? 0,
+      });
+    }
+
+    if (candidateIds.size === 0) {
+      console.warn(
+        '[GMAIL] Tidak ada kandidat email Disney ditemukan.'
+      );
+
       return null;
     }
 
-    // Ambil detail email secara paralel.
+    // ------------------------------------
+    // 4. AMBIL DETAIL EMAIL
+    // ------------------------------------
+
+    const ids = [...candidateIds];
+
     const results = await Promise.allSettled(
-      messages.map((item) =>
+      ids.map((id) =>
         gmail.users.messages.get(
           {
             userId: 'me',
-            id: item.id!,
+            id,
             format: 'full',
           },
-          requestOptions
+          options
         )
       )
     );
 
-    // Hindari memakai email lama jika detail
-    // kandidat pertama gagal diambil.
-    if (results[0]?.status === 'rejected') {
+    const rejectedCount = results.filter(
+      (result) => result.status === 'rejected'
+    ).length;
+
+    // Jika detail email ada yang gagal diambil,
+    // kita tidak bisa memastikan email terbaru.
+    if (rejectedCount > 0) {
       throw new Error(
-        'Gagal memeriksa email kandidat terbaru.'
+        `Gagal membaca ${rejectedCount} kandidat email Gmail.`
       );
     }
 
     const parsed: DisneyMessage[] = [];
 
+    let rejectedSender = 0;
+    let rejectedSubject = 0;
+
     for (const result of results) {
-      if (result.status === 'fulfilled') {
-        const message = parseMessage(
-          result.value.data
+      if (result.status !== 'fulfilled') {
+        continue;
+      }
+
+      const message = parseMessage(
+        result.value.data
+      );
+
+      const sender = normalizeEmailAddress(
+        message.sender_email
+      );
+
+      const senderMatches =
+        sender === DISNEY_SENDER;
+
+      const subjectMatches =
+        /(?:passcode|verification|security code|one[\s-]?time|otp|kode verifikasi)/i.test(
+          message.subject ?? ''
         );
 
-        if (isRelevantDisneyEmail(message)) {
-          parsed.push(message);
-        }
+      if (!senderMatches) {
+        rejectedSender += 1;
+      } else if (!subjectMatches) {
+        rejectedSubject += 1;
+      }
+
+      debugLog('Candidate', {
+        senderMatches,
+        subjectMatches,
+        receivedAt: message.received_at,
+        hasCode: Boolean(message.otp_code),
+      });
+
+      if (isRelevantDisneyEmail(message)) {
+        parsed.push(message);
       }
     }
 
+    debugLog('Validation', {
+      candidates: ids.length,
+      accepted: parsed.length,
+      rejectedSender,
+      rejectedSubject,
+    });
+
+    // ------------------------------------
+    // 5. PILIH EMAIL TERBARU
+    // ------------------------------------
+
     if (parsed.length === 0) {
+      console.warn(
+        '[GMAIL] Tidak ada email yang lolos validasi pengirim dan subjek.'
+      );
+
       return null;
     }
 
-    // Urutkan berdasarkan waktu Gmail, terbaru dahulu.
-    parsed.sort(
-      (a, b) =>
-        new Date(b.received_at ?? 0).getTime() -
-        new Date(a.received_at ?? 0).getTime()
+    parsed.sort((a, b) => {
+      const timeA = a.received_at
+        ? Date.parse(a.received_at)
+        : 0;
+
+      const timeB = b.received_at
+        ? Date.parse(b.received_at)
+        : 0;
+
+      return timeB - timeA;
+    });
+
+    const latest = parsed[0];
+
+    // Tidak memakai kode dari email lebih lama
+    // apabila email terbaru tidak terbaca.
+    debugLog('Latest email', {
+      receivedAt: latest.received_at,
+      hasCode: Boolean(latest.otp_code),
+      candidateCount: parsed.length,
+    });
+
+    return latest;
+  } catch (error) {
+    console.error(
+      '[GMAIL] Fetch failed:',
+      error instanceof Error
+        ? error.message
+        : 'Unknown error'
     );
 
-    // PENTING:
-    // Jangan mengambil email lama hanya karena
-    // email terbaru tidak berhasil diekstrak.
-    return parsed[0];
+    throw error;
   } finally {
     await Promise.all(tokenWrites);
   }
