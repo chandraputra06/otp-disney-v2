@@ -16,6 +16,7 @@ import {
 import LoadingScreen from './LoadingScreen';
 
 const REFRESH_SECONDS = 5;
+const OTP_MAX_AGE_MS = 15 * 60 * 1000;
 
 type OtpStatus =
   | 'success'
@@ -100,9 +101,23 @@ export default function OtpApp() {
   const [running, setRunning] = useState(true);
   const [toast, setToast] = useState(false);
 
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
   const lastPhone = useRef('');
   const inFlight = useRef(false);
   const countdownRef = useRef(REFRESH_SECONDS);
+
+  // Perbarui waktu untuk memastikan kode yang
+  // sudah lewat 15 menit otomatis tidak bisa disalin.
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, []);
 
   const showToast = () => {
     setToast(true);
@@ -120,7 +135,7 @@ export default function OtpApp() {
       showToast();
     } catch {
       setError(
-        'Gagal menyalin kode. Silakan salin secara manual.'
+        'Kode tidak dapat disalin secara otomatis.'
       );
     }
   };
@@ -138,7 +153,7 @@ export default function OtpApp() {
         return;
       }
 
-      // Jangan menjalankan dua request bersamaan.
+      // Hindari dua request berjalan bersamaan.
       if (inFlight.current) return;
 
       inFlight.current = true;
@@ -174,26 +189,34 @@ export default function OtpApp() {
         if (!response.ok) {
           if (response.status === 401) {
             throw new Error(
-              'Sesi login diperlukan. Silakan masuk melalui halaman login.'
+              'Sesi login berakhir. Silakan login kembali.'
             );
           }
 
           throw new Error(
             data?.message ??
-              `Permintaan gagal (HTTP ${response.status}).`
+              `Permintaan gagal. HTTP ${response.status}.`
           );
         }
 
-        setResult(data as OtpResult);
+        const otpResult = data as OtpResult;
 
-        // Reset countdown setelah respons.
+        // Respons tidak pernah mengambil last_otp_code
+        // dari riwayat untuk ditampilkan sebagai aktif.
+        setResult(otpResult);
+        setNowMs(Date.now());
+
         countdownRef.current = REFRESH_SECONDS;
         setSecs(REFRESH_SECONDS);
       } catch (err) {
+        // Jika permintaan gagal, jangan biarkan kode
+        // sebelumnya terus tampil di halaman.
+        setResult(null);
+
         setError(
           err instanceof Error
             ? err.message
-            : 'Gagal menghubungi server.'
+            : 'Gagal terhubung ke server.'
         );
       } finally {
         inFlight.current = false;
@@ -208,13 +231,16 @@ export default function OtpApp() {
     []
   );
 
-  // Countdown otomatis.
+  // Countdown auto-refresh.
   useEffect(() => {
     if (!result || !running) return;
 
     const interval = window.setInterval(() => {
-      // Hindari polling saat tab tidak aktif.
       if (document.hidden) return;
+
+      // Jangan mengirim request ketika Gmail
+      // masih sedang diperiksa.
+      if (inFlight.current) return;
 
       if (countdownRef.current <= 1) {
         countdownRef.current = REFRESH_SECONDS;
@@ -234,28 +260,44 @@ export default function OtpApp() {
     };
   }, [result, running, fetchOtp]);
 
-  // Kode yang sedang ditampilkan.
+  const receivedAtMs = result?.received_at
+    ? new Date(result.received_at).getTime()
+    : NaN;
+
+  const ageMs = nowMs - receivedAtMs;
+
+  const isExpired =
+    result?.status === 'success' &&
+    Number.isFinite(ageMs) &&
+    ageMs >= OTP_MAX_AGE_MS;
+
+  const isRecent =
+    Number.isFinite(ageMs) &&
+    ageMs >= -60_000 &&
+    ageMs < OTP_MAX_AGE_MS;
+
+  // Hanya tampilkan kode hasil pemeriksaan Gmail
+  // yang sukses dan masih berada dalam masa berlaku.
   const code =
-    result?.otp_code ??
-    result?.last_otp_code ??
-    null;
+    result?.status === 'success' && isRecent
+      ? result.otp_code
+      : null;
 
-  const isFallback =
-    Boolean(result) &&
-    !result?.otp_code &&
-    Boolean(result?.last_otp_code);
-
-  const timeIso = isFallback
-    ? result?.last_received_at
-    : result?.received_at;
+  const timeIso = result?.received_at ?? null;
 
   const chip = result
     ? chipStyle(result.status)
     : null;
 
+  const statusLabel = isExpired
+    ? 'Kode Kedaluwarsa'
+    : result?.status_label ?? '';
+
   return (
     <main className="otp-wrap">
       <div className="otp-container">
+
+        {/* HEADER */}
         <div className="otp-head">
           <span className="otp-pill">
             <span className="dot" />
@@ -270,6 +312,7 @@ export default function OtpApp() {
           </p>
         </div>
 
+        {/* FORM NOMOR HANDPHONE */}
         <div className="otp-card">
           <p className="field-label">
             Nomor handphone
@@ -282,7 +325,18 @@ export default function OtpApp() {
               placeholder="Masukkan nomor handphone"
               value={phone}
               onChange={(event) => {
-                setPhone(event.target.value);
+                const value = event.target.value;
+                setPhone(value);
+
+                // Hapus hasil lama ketika nomor diganti.
+                if (
+                  value.replace(/\D+/g, '') !==
+                  lastPhone.current
+                ) {
+                  setResult(null);
+                  setError(null);
+                  setRunning(false);
+                }
               }}
               onKeyDown={(event) => {
                 if (event.key === 'Enter') {
@@ -326,33 +380,43 @@ export default function OtpApp() {
           )}
         </div>
 
+        {/* HASIL OTP */}
         {result && chip && (
           <div className="otp-panel">
+
             <div className="otp-toprow">
               <span
                 className="otp-chip"
                 style={{
-                  background: chip.bg,
-                  color: chip.fg,
+                  background: isExpired
+                    ? '#fee2e2'
+                    : chip.bg,
+                  color: isExpired
+                    ? '#b91c1c'
+                    : chip.fg,
                 }}
               >
                 <i
-                  className={`fa-solid ${chip.icon}`}
+                  className={`fa-solid ${
+                    isExpired
+                      ? 'fa-clock'
+                      : chip.icon
+                  }`}
                 />
 
-                {result.status_label}
+                {statusLabel}
               </span>
 
               {timeIso && (
                 <span className="otp-fresh">
                   <i className="fa-solid fa-circle" />
-
                   Diterima{' '}
                   {witaTimeShort(timeIso)} WITA
                 </span>
               )}
             </div>
 
+            {/* KODE OTP */}
             <button
               className="otp-codebox"
               disabled={!code}
@@ -361,9 +425,9 @@ export default function OtpApp() {
               }}
             >
               <p className="cap">
-                {isFallback
-                  ? 'OTP TERAKHIR · KETUK UNTUK SALIN'
-                  : 'KODE OTP · KETUK UNTUK SALIN'}
+                {code
+                  ? 'KODE EMAIL TERBARU · KETUK UNTUK SALIN'
+                  : 'KODE TERBARU BELUM TERSEDIA'}
               </p>
 
               <p className="code">
@@ -371,11 +435,21 @@ export default function OtpApp() {
               </p>
 
               <span className="hint">
-                <i className="fa-solid fa-copy" />
-                {code ? 'Salin kode' : 'Tidak ada kode'}
+                <i
+                  className={`fa-solid ${
+                    code
+                      ? 'fa-copy'
+                      : 'fa-clock'
+                  }`}
+                />
+
+                {code
+                  ? 'Salin kode'
+                  : 'Tidak ada kode aktif'}
               </span>
             </button>
 
+            {/* DETAIL OTP */}
             <div className="otp-timerow">
               <span className="lbl">
                 <i className="fa-solid fa-phone" />
@@ -389,12 +463,21 @@ export default function OtpApp() {
               </span>
             </div>
 
-            {result.message && (
+            {isExpired ? (
               <p className="otp-msg">
-                {result.message}
+                Kode dari email terakhir sudah melewati
+                15 menit. Silakan minta kode baru melalui
+                Disney+.
               </p>
+            ) : (
+              result.message && (
+                <p className="otp-msg">
+                  {result.message}
+                </p>
+              )
             )}
 
+            {/* AUTO REFRESH */}
             <div className="otp-refreshrow">
               <div className="otp-bar-track">
                 <div
@@ -436,6 +519,7 @@ export default function OtpApp() {
           </div>
         )}
 
+        {/* EMPTY STATE */}
         {!result && (
           <div className="otp-empty">
             <div className="ic">
@@ -452,6 +536,7 @@ export default function OtpApp() {
         )}
       </div>
 
+      {/* TOAST COPY */}
       <div
         className={`otp-toast ${
           toast ? 'show' : ''
@@ -461,7 +546,7 @@ export default function OtpApp() {
         Kode tersalin
       </div>
 
-      {/* Loading fullscreen hanya saat pencarian manual */}
+      {/* FULLSCREEN LOADING */}
       {loading && (
         <LoadingScreen
           title="Mencari kode terbaru"
